@@ -78,7 +78,8 @@ void handle_main_fsm();
 void handle_led_blink_fsm();
 void handle_button_debounce_fsm();
 
-void configure_timer();
+void configure_timer_for_one_shot();
+void configure_timer_for_counting();
 
 void on_button_change();
 void on_timer_interrupt();
@@ -107,7 +108,7 @@ void setup()
 
   attachInterrupt(digitalPinToInterrupt(buttonPin), on_button_change, CHANGE);
 
-  configure_timer();
+  configure_timer_for_one_shot();
 
   #if DEBUG
   Serial.begin(115200);
@@ -122,6 +123,9 @@ void loop()
 
   #if DEBUG
   debug_fsm_states();
+  if (timer_interrupt_happened) {
+    Serial.println("timer_interrupt_happened");
+  }
   #endif
 }
 
@@ -327,7 +331,7 @@ void handle_button_debounce_fsm()
   }
 }
 
-void configure_timer()
+void configure_timer_for_one_shot()
 {
   cli();
 
@@ -335,6 +339,16 @@ void configure_timer()
   TCCR1B = 0;              // clear config register
   TCCR1B |= (1 << WGM12);  // configure timer 1 for CTC mode
   TIMSK1 |= (1 << OCIE1A); // enable CTC interrupt
+
+  sei();
+}
+
+void configure_timer_for_counting()
+{
+  cli();
+
+
+  TCNT1 = 0; // reset counter
 
   sei();
 }
@@ -362,23 +376,37 @@ ISR(TIMER1_COMPA_vect)
 
 void start_timer_period(int time_ms)
 {
+  #ifdef DEBUG
+    Serial.println("start_timer_period");
+  #endif
+
   unsigned prescaler = get_best_prescaler(time_ms);
   unsigned mask = get_prescaler_mask(prescaler);
 
+  configure_timer_for_one_shot();
+  
   OCR1A = time_ms * (F_CPU / 1000) / prescaler; // set compare value
   TCCR1B |= mask;                               // start timer with appropriate prescaler
 }
 
 void start_timer_as_counter()
 {
-  TIMSK1 &= ~(1 << OCIE1A);                         // disable CTC interrupt
+  #ifdef DEBUG
+    Serial.println("start_timer_as_counter");
+  #endif
+
+  configure_timer_for_counting();
+
   TCCR1B |= get_prescaler_mask(counter_prescaler);  // start timer as counter with 1024 prescaler
 }
 
 void compute_button_pressed_time_and_reset_counter()
 {
+  #ifdef DEBUG
+    Serial.println("compute_button_pressed_time_and_reset_counter");
+  #endif
+
   button_pressed_time_ms += TCNT1 * counter_prescaler / (F_CPU / 1000); // compute time in ms
-  TCNT1 = 0;                                                            // reset counter
 }
 
 constexpr unsigned get_best_prescaler(unsigned time_ms)
