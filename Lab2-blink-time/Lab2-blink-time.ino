@@ -1,14 +1,7 @@
-// simulation: 
-
-/*
-- Any change in the button state needs do be debounced;
-- The LED should blink N times, where N = ceil(T / 2), where T is the time in seconds during which the button was held pressed;
-*/
-
 #define DEBUG 1
 
 const int buttonPin = 2;
-const int ledPin = 13;
+const int ledPin = 3;
 const int blink_led_on_time = 500;
 const int blink_led_off_time = 500;
 const int debounce_time = 50;
@@ -18,7 +11,11 @@ const int button_released_val = !button_pressed_val;
 const int counter_prescaler = 1024;
 
 const unsigned long max_count = 65535;
-const unsigned long cpu_freq_khz = F_CPU / 1000;
+const unsigned long cpu_freq_hz = F_CPU;
+const unsigned long cpu_freq_khz = cpu_freq_hz / 1000;
+const unsigned long cpu_freq_Mhz = cpu_freq_khz / 1000;
+
+const float ticks_to_seconds = (float) counter_prescaler / (float) cpu_freq_hz;
 
 enum MAIN_STATE {
   MAIN_STATE_START,
@@ -56,7 +53,8 @@ char process_isr = 0;
 char is_button_pressed = 0;
 char blink_led = 0;
 
-unsigned button_pressed_time_ms = 0;
+unsigned button_pressed_ticks = 0;
+float button_pressed_time_s = 0;
 char times_to_blink = 0;
 char should_count = 0;
 
@@ -67,12 +65,6 @@ volatile char button_interrupt_happened = 0;
 MAIN_STATE main_state;
 LED_BLINK_STATE led_blink_state;
 BUTTON_DEBOUNCE_STATE button_debounce_state;
-
-#if DEBUG
-MAIN_STATE last_main_state;
-LED_BLINK_STATE last_led_blink_state;
-BUTTON_DEBOUNCE_STATE last_button_debounce_state;
-#endif
 
 void handle_main_fsm();
 void handle_led_blink_fsm();
@@ -86,14 +78,10 @@ void on_timer_interrupt();
 
 void start_timer_period(int time_ms);
 void start_timer_as_counter();
-void compute_button_pressed_time_and_reset_counter();
+void capture_ticks();
 
 constexpr unsigned get_best_prescaler(unsigned time_ms);
 constexpr char get_prescaler_mask(unsigned prescaler);
-
-#if DEBUG
-void debug_fsm_states();
-#endif
 
 void setup()
 {
@@ -120,13 +108,6 @@ void loop()
   handle_main_fsm();
   handle_led_blink_fsm();
   handle_button_debounce_fsm();
-
-  #if DEBUG
-  debug_fsm_states();
-  if (timer_interrupt_happened) {
-    Serial.println("timer_interrupt_happened");
-  }
-  #endif
 }
 
 void handle_main_fsm()
@@ -139,7 +120,7 @@ void handle_main_fsm()
       break;
     case MAIN_STATE_BUTTON_RELEASED_0:
       if (is_button_pressed) {
-        button_pressed_time_ms = 0;
+        button_pressed_ticks = 0;
         should_count = 1;
         main_state = MAIN_STATE_BUTTON_PRESSED;
       }
@@ -147,7 +128,16 @@ void handle_main_fsm()
     case MAIN_STATE_BUTTON_PRESSED:
       if (not is_button_pressed) {
         should_count = 0;
-        times_to_blink = ceil(button_pressed_time_ms / 2);
+        button_pressed_time_s = (float) button_pressed_ticks * ticks_to_seconds;
+        times_to_blink = ceil(button_pressed_time_s / 2);
+
+        #ifdef DEBUG
+          Serial.print("button_pressed_time_s: ");
+          Serial.print(button_pressed_time_s);
+          Serial.print(" times_to_blink: ");
+          Serial.println((int) times_to_blink);
+        #endif
+
         main_state = MAIN_STATE_BUTTON_RELEASED_1;
       }
       break;
@@ -201,13 +191,14 @@ void handle_led_blink_fsm()
         timer_interrupt_happened = 0;
         digitalWrite(ledPin, HIGH);
 
-        if (times_to_blink > 0) {
+        if (times_to_blink > 1) {
           times_to_blink--;
           led_blink_state = LED_BLINK_STATE_WAIT;
         } else {
           start_timer_period(led_ack_time);
           led_blink_state = LED_BLINK_STATE_ON_ACK_0;
         }
+
       }
       break;
     case LED_BLINK_STATE_ON_ACK_0:
@@ -252,12 +243,12 @@ void handle_button_debounce_fsm()
       }
       break;
     case BUTTON_DEBOUNCE_STATE_CHECK_STATE:
-
-      if (should_count) {
-        start_timer_as_counter();
-      }
-
       if (is_button_pressed) {
+
+        if (should_count) {
+          start_timer_as_counter();
+        }
+
         button_debounce_state = BUTTON_DEBOUNCE_STATE_WAIT_RELEASE;
       } else {
         button_debounce_state = BUTTON_DEBOUNCE_STATE_WAIT_PRESS;
@@ -269,7 +260,14 @@ void handle_button_debounce_fsm()
         if (button_reading == button_released_val) {
 
           if (should_count) {
-            compute_button_pressed_time_and_reset_counter();
+
+            #ifdef DEBUG
+              Serial.print("debounce started at: ");
+              Serial.print(button_pressed_ticks);
+              Serial.println(" ticks");
+            #endif
+
+            capture_ticks();
           }
 
           start_timer_period(debounce_time);
@@ -298,11 +296,6 @@ void handle_button_debounce_fsm()
       if (button_interrupt_happened) {
         button_interrupt_happened = 0;
         if (button_reading == button_pressed_val) {
-
-          if (should_count) {
-            compute_button_pressed_time_and_reset_counter();
-          }
-
           start_timer_period(debounce_time);
           button_debounce_state = BUTTON_DEBOUNCE_STATE_DEBOUNCE_PRESS;
         }
@@ -335,10 +328,9 @@ void configure_timer_for_one_shot()
 {
   cli();
 
-  TCCR1A = 0;              // clear config register
-  TCCR1B = 0;              // clear config register
-  TCCR1B |= (1 << WGM12);  // configure timer 1 for CTC mode
-  TIMSK1 |= (1 << OCIE1A); // enable CTC interrupt
+  TCCR1A = 0;             // clear config register
+  TCCR1B = (1 << WGM12);  // configure timer 1 for CTC mode
+  TIMSK1 = (1 << OCIE1A); // enable CTC interrupt
 
   sei();
 }
@@ -347,8 +339,10 @@ void configure_timer_for_counting()
 {
   cli();
 
-
-  TCNT1 = 0; // reset counter
+  TCCR1A = 0; // clear config register
+  TCCR1B = 0; // clear config register
+  TIMSK1 = 0; // disable all interrupts
+  TCNT1 = 0;  // reset counter
 
   sei();
 }
@@ -376,37 +370,25 @@ ISR(TIMER1_COMPA_vect)
 
 void start_timer_period(int time_ms)
 {
-  #ifdef DEBUG
-    Serial.println("start_timer_period");
-  #endif
-
   unsigned prescaler = get_best_prescaler(time_ms);
   unsigned mask = get_prescaler_mask(prescaler);
 
   configure_timer_for_one_shot();
   
-  OCR1A = time_ms * (F_CPU / 1000) / prescaler; // set compare value
+  OCR1A = time_ms * cpu_freq_khz / prescaler; // set compare value
   TCCR1B |= mask;                               // start timer with appropriate prescaler
 }
 
 void start_timer_as_counter()
 {
-  #ifdef DEBUG
-    Serial.println("start_timer_as_counter");
-  #endif
-
   configure_timer_for_counting();
 
   TCCR1B |= get_prescaler_mask(counter_prescaler);  // start timer as counter with 1024 prescaler
 }
 
-void compute_button_pressed_time_and_reset_counter()
+void capture_ticks()
 {
-  #ifdef DEBUG
-    Serial.println("compute_button_pressed_time_and_reset_counter");
-  #endif
-
-  button_pressed_time_ms += TCNT1 * counter_prescaler / (F_CPU / 1000); // compute time in ms
+  button_pressed_ticks += TCNT1;
 }
 
 constexpr unsigned get_best_prescaler(unsigned time_ms)
@@ -425,127 +407,3 @@ constexpr char get_prescaler_mask(unsigned prescaler)
          (prescaler == 256) ? (1 << CS12) :
          (prescaler == 1024) ? (1 << CS12) | (1 << CS10) : 0;
 }
-
-#if DEBUG
-void print_fsm_state_main(MAIN_STATE state);
-void print_fsm_state_led_blink(LED_BLINK_STATE state);
-void print_fsm_state_button_debounce(BUTTON_DEBOUNCE_STATE state);
-
-void debug_fsm_states()
-{
-  if (main_state != last_main_state
-      or led_blink_state != last_led_blink_state
-      or button_debounce_state != last_button_debounce_state) {
-
-    print_fsm_state_main(main_state);
-    Serial.print("\t");
-    print_fsm_state_led_blink(led_blink_state);
-    Serial.print("\t");
-    print_fsm_state_button_debounce(button_debounce_state);
-    Serial.println();
-
-    last_main_state = main_state;
-    last_led_blink_state = led_blink_state;
-    last_button_debounce_state = button_debounce_state;
-  }
-}
-
-void print_fsm_state_main(MAIN_STATE state)
-{
-  Serial.print("MAIN_STATE_");
-  switch (state) {
-    case MAIN_STATE_START:
-      Serial.print("START");
-      break;
-    case MAIN_STATE_BUTTON_RELEASED_0:
-      Serial.print("BUTTON_RELEASED_0");
-      break;
-    case MAIN_STATE_BUTTON_PRESSED:
-      Serial.print("BUTTON_PRESSED");
-      break;
-    case MAIN_STATE_BUTTON_RELEASED_1:
-      Serial.print("BUTTON_RELEASED_1");
-      break;
-    case MAIN_STATE_LED_BLINK:
-      Serial.print("LED_BLINK");
-      break;
-    case MAIN_STATE_WAIT_BUTTON_RELEASE:
-      Serial.print("WAIT_BUTTON_RELEASE");
-      break;
-    default:
-      Serial.print("UNKNOWN");
-      break;
-  }
-}
-
-void print_fsm_state_led_blink(LED_BLINK_STATE state)
-{
-  Serial.print("LED_BLINK_STATE_");
-  switch (state) {
-    case LED_BLINK_STATE_WAIT:
-      Serial.print("WAIT");
-      break;
-    case LED_BLINK_STATE_ON_BLINK:
-      Serial.print("ON_BLINK");
-      break;
-    case LED_BLINK_STATE_OFF_BLINK:
-      Serial.print("OFF_BLINK");
-      break;
-    case LED_BLINK_STATE_ON_ACK_0:
-      Serial.print("ON_ACK_0");
-      break;
-    case LED_BLINK_STATE_OFF_ACK_0:
-      Serial.print("OFF_ACK_0");
-      break;
-    case LED_BLINK_STATE_ON_ACK_1:
-      Serial.print("ON_ACK_1");
-      break;
-    case LED_BLINK_STATE_OFF_ACK_1:
-      Serial.print("OFF_ACK_1");
-      break;
-    default:
-      Serial.print("UNKNOWN");
-      break;
-  }
-}
-
-void print_fsm_state_button_debounce(BUTTON_DEBOUNCE_STATE state)
-{
-  Serial.print("BUTTON_DEBOUNCE_STATE_");
-  switch (state) {
-    case BUTTON_DEBOUNCE_STATE_WAIT:
-      Serial.print("WAIT");
-      break;
-    case BUTTON_DEBOUNCE_STATE_CHECK_STATE:
-      Serial.print("CHECK_STATE");
-      break;
-    case BUTTON_DEBOUNCE_STATE_WAIT_RELEASE:
-      Serial.print("WAIT_RELEASE");
-      break;
-    case BUTTON_DEBOUNCE_STATE_DEBOUNCE_RELEASE:
-      Serial.print("DEBOUNCE_RELEASE");
-      break;
-    case BUTTON_DEBOUNCE_STATE_CHECK_RELEASE:
-      Serial.print("CHECK_RELEASE");
-      break;
-    case BUTTON_DEBOUNCE_STATE_RELEASED:
-      Serial.print("RELEASED");
-      break;
-    case BUTTON_DEBOUNCE_STATE_WAIT_PRESS:
-      Serial.print("WAIT_PRESS");
-      break;
-    case BUTTON_DEBOUNCE_STATE_DEBOUNCE_PRESS:
-      Serial.print("DEBOUNCE_PRESS");
-      break;
-    case BUTTON_DEBOUNCE_STATE_CHECK_PRESS:
-      Serial.print("CHECK_PRESS");
-      break;
-    case BUTTON_DEBOUNCE_STATE_PRESSED:
-      Serial.print("PRESSED");
-      break;
-    default:
-      Serial.print("UNKNOWN");
-      break;
-  }
-}
-#endif
